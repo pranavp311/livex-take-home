@@ -1,6 +1,7 @@
 """The agent must never change the calendar without a confirm, and a card runs at most once."""
 
 import json
+from datetime import datetime
 
 import httpx
 import pytest
@@ -29,7 +30,7 @@ class FakeCal:
     def handler(self, req: httpx.Request) -> httpx.Response:
         self.requests.append((req.method, req.url.path))
         path = req.url.path
-        if req.method == "POST" and self.timeout_writes or req.method == "GET" and self.timeout_reads:
+        if req.method == "POST" and self.timeout_writes or path == "/v2/bookings" and self.timeout_reads:
             raise httpx.ReadTimeout("slow", request=req)
         if req.method == "POST":
             if self.fail_writes:
@@ -65,10 +66,10 @@ class FakeLLM:
         if isinstance(turn, str):
             msg = {"role": "assistant", "content": turn}
         else:
-            name, args = turn
+            calls = turn if isinstance(turn, list) else [turn]  # a list is several tool calls in one round
             msg = {"role": "assistant", "content": None, "tool_calls": [{
-                "id": f"call_{len(self.turns)}", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)}}]}
+                "id": f"call_{len(self.turns)}_{i}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)}} for i, (name, args) in enumerate(calls)]}
         return ChatCompletion.model_validate({
             "id": "x", "object": "chat.completion", "created": 0, "model": "m",
             "choices": [{"index": 0, "finish_reason": "stop", "message": msg}]})
@@ -112,7 +113,7 @@ def test_cancel_goes_out_only_on_confirm():
 
 def test_failed_confirm_burns_card_and_bot_follows_up():
     # Retrying a write that may have half-succeeded risks a double booking, so the card is spent.
-    agent, fake, s = make([("reschedule", {"uid": "bk_1", "new_start": "2026-10-28T17:00"}), "Move it?",
+    agent, fake, s = make([("reschedule", {"uid": "bk_1", "new_start": "2026-10-28T17:00"}),
                            "5:00 was just taken. Want 5:30?"], fail_writes=True)
     card = agent.chat(s, "move my 3pm to 5pm")["cards"][0]
     assert card["old_start"] == "2026-10-28T15:00" and card["minutes"] == 30
@@ -152,8 +153,10 @@ def test_read_timeout_becomes_tool_error_so_history_stays_valid():
 
 def test_unexpected_error_rolls_turn_back():
     # A crash mid-turn must not leave an unanswered tool call, which would make every later request fail.
-    agent, fake, s = make([("book", {"event_type_id": 7, "start": "2026-10-29T14:00",
-                                     "attendee_name": "P", "attendee_email": "p@example.com"})])
+    # The card and a lookup in one round means another model call is due, and the script has run out.
+    agent, fake, s = make([[("book", {"event_type_id": 7, "start": "2026-10-29T14:00",
+                                      "attendee_name": "P", "attendee_email": "p@example.com"}),
+                            ("list_event_types", {})]])
     s.messages.append({"role": "user", "content": "earlier"})
     with pytest.raises(IndexError):  # the script runs out: the model call itself blows up
         agent.chat(s, "book it")
@@ -218,6 +221,7 @@ def test_missing_details_open_the_quick_fill_card_with_what_is_known():
     assert form["prefill"] == {"name": "Priya", "email": None, "day": "2026-10-29", "event_type_id": 7}
     assert form["event_types"] == [{"id": 7, "title": "30 min intro", "minutes": 30}]
     assert form["slots"] == ["2026-10-29T14:00"]  # local time, not UTC
+    assert form["open_days"] == ["2026-10-29"]
     # One entry per person even though they appear on both the upcoming and past lists.
     assert form["contacts"] == [{"name": "Dana", "email": "dana@example.com"}]
     assert fake.writes() == []
@@ -269,3 +273,66 @@ def test_book_card_shows_the_email_so_a_wrong_one_can_be_caught():
     agent, fake, s = make([])
     card = agent.propose(s, 7, "2026-10-29T14:00", "Priya", "priya@example.com")["cards"][0]
     assert card["email"] == "priya@example.com"
+
+
+def test_full_day_opens_the_card_on_the_next_free_day():
+    # "No open times" on a day the founder is booked up is a dead end; land on the next day they're free.
+    agent, fake, s = make([])
+    form = agent.booking_form(LA, "2026-10-28")
+    assert form["asked_day"] == "2026-10-28"
+    assert form["day"] == "2026-10-29" and form["slots"] == ["2026-10-29T14:00"]
+
+
+def test_turn_ends_once_the_card_is_on_screen():
+    # Every model round costs the founder a second or two. Once the card and chips are showing, stop.
+    agent, fake, s = make([[("book", {"event_type_id": 7, "start": "2026-10-29T14:00", "attendee_name": "P",
+                                      "attendee_email": "p@example.com"}),
+                            ("show_options", {"options": [{"label": "2:30", "value": "Thursday 2:30 PM"}]})]])
+    out = agent.chat(s, "book p thursday 2pm")
+    assert agent.llm.turns == []  # one model call, not two
+    assert out["reply"] == "Book this?" and len(out["cards"]) == 1 and len(out["options"]) == 1
+
+
+def test_event_types_are_in_the_prompt_so_the_model_skips_a_lookup():
+    agent, fake, s = make(["hi"])
+    seen = []
+    create = agent.llm.create
+    agent.llm.create = lambda **kw: seen.append(kw["messages"][0]["content"]) or create(**kw)
+    agent.chat(s, "hello")
+    assert "7: 30 min intro, 30" in seen[0]
+
+
+def test_find_slots_hands_back_the_closest_times_in_one_call():
+    # The model shouldn't need to hunt day by day (slow) or guess (wrong): one call gives it the nearest options.
+    agent, fake, s = make([("find_slots", {"event_type_id": 7, "start": "2026-10-29T19:00", "end": "2026-10-29T20:00"}),
+                           "ok"])
+    agent.chat(s, "book thursday 7pm")
+    result = json.loads(next(m for m in s.messages if m["role"] == "tool")["content"])
+    assert result == {"in_window": [], "closest": ["2026-10-29T14:00"]}
+    assert fake.requests.count(("GET", "/v2/slots")) == 1
+
+
+def test_find_slots_accepts_times_with_an_offset():
+    # The model sometimes writes "2026-10-29T19:00:00-07:00"; that must not crash the turn.
+    agent, fake, s = make([("find_slots", {"event_type_id": 7, "start": "2026-10-29T19:00:00-07:00",
+                                           "end": "2026-10-30T03:00:00Z"}), "ok"])
+    agent.chat(s, "thursday 7pm")
+    result = json.loads(next(m for m in s.messages if m["role"] == "tool")["content"])
+    assert result["closest"] == ["2026-10-29T14:00"]
+
+
+def test_a_stray_year_never_asks_cal_com_for_years_of_slots():
+    agent, fake, s = make([])
+    seen = []
+    agent.cal.slots = lambda et, lo, hi, tz, uid=None: seen.append((lo, hi)) or {}
+    agent.booking_form(LA, "2099-01-01")
+    agent.booking_form(LA, "2020-01-01")
+    for lo, hi in seen:
+        span = datetime.fromisoformat(hi[:-1]) - datetime.fromisoformat(lo[:-1])
+        assert span.days <= 15
+
+
+def test_fast_turn_keeps_its_reply_in_history():
+    agent, fake, s = make([("show_options", {"options": [{"label": "a", "value": "a"}]})])
+    agent.chat(s, "move a meeting")
+    assert s.messages[-1] == {"role": "assistant", "content": "Which one?"}

@@ -34,6 +34,12 @@
         </div>
       </div>
       <form class="composer" id="form" autocomplete="off">
+        <div class="suggest off" id="suggest" role="group" aria-label="Suggestions" inert>
+          <button class="sug" type="button" data-act="book">Book a meeting</button>
+          <button class="sug" type="button" data-say="What's left today?">What's next?</button>
+          <button class="sug" type="button" data-say="Move a meeting">Move a meeting</button>
+          <button class="sug" type="button" data-say="Cancel a meeting">Cancel a meeting</button>
+        </div>
         <div class="input">
           <label for="ask" class="sr">Message the assistant</label>
           <input id="ask" maxlength="2000" placeholder="Book, move or cancel…" enterkeyhint="send">

@@ -23,6 +23,8 @@
   const SWAP = '<svg width="28" height="16" viewBox="0 0 28 16" fill="none" aria-hidden="true"><path d="M5 8h18M18.5 3.5L23 8l-4.5 4.5" stroke="#050505" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const CHECK = '<svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 6.2l2.3 2.3 4.7-5" stroke="#050DC8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const ALERT = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.5" stroke="#050505" stroke-width="1.3"/><path d="M8 4.8v3.6" stroke="#050505" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="10.9" r=".8" fill="#050505"/></svg>';
+  const CLOSE = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+  const INFO = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5.75" stroke="currentColor" stroke-width="1.2"/><path d="M7 6.3v3.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="7" cy="4.4" r=".75" fill="currentColor"/></svg>';
   const chev = c => `<svg class="chev" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 3.5L5 6.5l3-3" stroke="${c}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
   function h(tag, props, ...kids) {
@@ -166,7 +168,7 @@
       m.when = range(next.s, next.e);
       m.what = next.title;
     } else if (isToday) {
-      m.when = `Open until ${hm(hi)} ${ap(hi)}`;
+      m.when = now < Math.max(1080, last) ? `Open until ${hm(Math.max(1080, last))} ${ap(Math.max(1080, last))}` : 'Day done';
       m.what = real.length ? 'Nothing else today' : 'No meetings today';
     } else {
       m.when = real.length ? rangeAP(real[0].s, last) : 'Nothing booked';
@@ -303,12 +305,26 @@
   const stack = $('#stack'), log = $('#log'), chat = $('#chat'), input = $('#ask'), sendBtn = $('#send');
   function push(el) {
     const intro = $('#intro');
-    if (intro) intro.remove();
+    if (intro) { intro.remove(); syncSuggest(); }
     stack.append(el);
     requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
     return el;
   }
   const botLine = text => h('p', { class: 'bot' }, text);
+  // Suggested actions above the input (desktop). Hidden, but still holding their space, while a
+  // request is in flight or the first-run intro already offers starters, so the chat never jumps.
+  const suggest = $('#suggest');
+  function syncSuggest() {
+    const off = S.busy || !!$('#intro');
+    suggest.classList.toggle('off', off);
+    suggest.inert = off;
+  }
+  suggest.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b || S.busy) return;
+    if (b.dataset.act === 'book') openNew();
+    else send(b.dataset.say);
+  });
 
   const TIMED = /^(\d{1,2}:\d{2})(?:\s*[ap]\.?m\.?)?\s*[—–\-:·]?\s*(.+)$/i;
   function botBubble(reply) {
@@ -389,8 +405,6 @@
       let sub = cardWhen(start, c, true);
       if (c.kind === 'cancel' && c.attendee) sub += ` · ${String(c.attendee).split(' ')[0]} will be told`;
       el.append(h('div', { class: 'head' }, title, h('span', { class: 'sub' }, sub)));
-      // The email is shown so a wrong address can be caught before the invite goes out.
-      if (c.kind === 'book' && c.attendee) detail = `${c.minutes} min · invite to ${c.attendee}${c.email ? ` · ${c.email}` : ''}`;
     }
     const primary = c.kind === 'cancel'
       ? h('button', { class: 'ink', type: 'button' }, 'Cancel it')
@@ -405,10 +419,23 @@
       acts.append(more);
       el.append(d);
     }
+    if (c.kind === 'book') el.append(availabilityNote(c));
     el.append(acts);
     primary.onclick = () => confirmCard(c, el);
     secondary.onclick = () => { S.cards.delete(c.change_id); el.remove(); renderPanel(); input.focus(); };
     push(el);
+  }
+
+  // cal.com checks only the founder's calendar. Say so in one quiet line; the rest shows on hover, focus or tap.
+  // The email sits in the reveal so a wrong address can be caught before the invite goes out.
+  function availabilityNote(c) {
+    const who = c.attendee || 'They';
+    const more = h('span', { class: 'more-note', id: `note-${c.change_id}` },
+      `${who} gets an email invite${c.email ? ` at ${c.email}` : ''}. Make sure the time works for them.`);
+    const btn = h('button', { class: 'note', type: 'button', 'aria-expanded': 'false', 'aria-controls': `note-${c.change_id}` },
+      icon(INFO), 'Only your calendar was checked');
+    btn.onclick = () => btn.setAttribute('aria-expanded', String(btn.getAttribute('aria-expanded') !== 'true'));
+    return h('div', { class: 'avail' }, btn, more);
   }
 
   function receipt(word, c, start) {
@@ -462,7 +489,7 @@
     } else {
       if (el) {
         el.querySelector('.acts').remove();
-        const d = el.querySelector('.detail'); if (d) d.remove();
+        el.querySelectorAll('.detail, .avail').forEach(x => x.remove());
         const sub = el.querySelector('.sub, .swap .new'); if (sub) sub.classList.add('struck');
         el.append(h('div', { class: 'alert enter', role: 'alert' }, h('span', null, icon(ALERT), r.message || "That didn't go through.")));
       } else push(botLine(r.message || "That didn't go through."));
@@ -575,9 +602,11 @@
     const st = {
       type: (types.find(t => t.id === pre.event_type_id) || types[0] || {}).id,
       day: f.day || pre.day || todayStr(), slots: f.slots || [], slot: null,
+      openDays: Array.isArray(f.open_days) ? new Set(f.open_days) : null, // null: server didn't say, treat all as open
       other: false, more: false, loading: false, err: '', seq: 0, sent: false,
     };
-    const chip = (label, on, onclick, title) => h('button', { class: on ? 'chip on' : 'chip', type: 'button', 'aria-pressed': String(on), title, onclick }, label);
+    const isOpen = d => !st.openDays || st.openDays.has(d);
+    const chip = (label, on, onclick, title, cls = '') => h('button', { class: `chip${on ? ' on' : ''}${cls ? ' ' + cls : ''}`, type: 'button', 'aria-pressed': String(on), title, onclick }, label);
     const sec = (label, ...kids) => h('div', { class: 'sec' }, h('span', { class: 'lab' }, label), ...kids);
 
     const typeRow = h('div', { class: 'chips' });
@@ -592,14 +621,23 @@
     const people = h('div', { class: 'chips' });
     const drawPeople = () => people.replaceChildren(...(f.contacts || []).map(c =>
       chip(c.name || c.email, name.value === (c.name || '') && email.value === c.email, () => {
-        name.value = c.name || ''; email.value = c.email || ''; hint.hidden = true; drawPeople(); update();
+        const picked = name.value === (c.name || '') && email.value === c.email;
+        name.value = picked ? '' : c.name || ''; // tapping the selected person again clears them
+        email.value = picked ? '' : c.email || '';
+        hint.hidden = true; drawPeople(); update();
       }, c.email)));
 
     const days = nextDays();
     if (!days.includes(st.day)) days.push(st.day);
     const dayRow = h('div', { class: 'chips' });
+    const pickDay = d => {
+      if (st.day === d) return;
+      st.day = d; st.slot = null; st.more = false;
+      drawDays();
+      if (isOpen(d)) refetch(); else { drawSlots(); update(); }
+    };
     const drawDays = () => dayRow.replaceChildren(...days.map(d =>
-      chip(chipDay(d), d === st.day, () => { if (st.day === d) return; st.day = d; drawDays(); refetch(); })));
+      chip(chipDay(d), d === st.day, () => pickDay(d), null, isOpen(d) ? '' : 'muted')));
 
     const time = h('input', { type: 'time', 'aria-label': 'Other time', step: '300' });
     time.addEventListener('input', update);
@@ -608,8 +646,18 @@
       const kids = [];
       if (st.loading) kids.push(h('span', { class: 'hint' }, 'Finding open times…'));
       else if (st.err) kids.push(h('span', { class: 'hint' }, st.err));
-      else if (!st.slots.length) kids.push(h('span', { class: 'hint' }, 'No open times. Pick another day.'));
-      else {
+      else if (!isOpen(st.day) || !st.slots.length) {
+        // A full day: say so once and offer the next free day, nothing else.
+        const l = dayLabel(st.day);
+        kids.push(h('span', { class: 'hint' }, `You're not free ${l === 'Today' || l === 'Tomorrow' ? l.toLowerCase()
+          : 'on ' + toDate(st.day).toLocaleDateString('en-US', { weekday: 'short' })}.`));
+        const next = st.openDays && [...st.openDays].sort().find(d => d > st.day);
+        if (next) kids.push(chip(`${chipDay(next)} →`, false, () => { if (!days.includes(next)) days.push(next); pickDay(next); }, null, 'jump'));
+        slotRow.replaceChildren(...kids);
+        time.hidden = true;
+        st.other = false;
+        return;
+      } else {
         const shown = st.more ? st.slots : st.slots.slice(0, SLOTS_SHOWN);
         for (const sl of shown) kids.push(chip(hm(minOf(sl)), !st.other && st.slot === sl, () => { st.slot = sl; st.other = false; drawSlots(); update(); }));
         if (!st.more && st.slots.length > SLOTS_SHOWN) kids.push(chip(`+${st.slots.length - SLOTS_SHOWN} more`, false, () => { st.more = true; drawSlots(); }));
@@ -624,7 +672,11 @@
       drawSlots(); update();
       try {
         const r = await api(`/api/booking-form?tz=${encodeURIComponent(TZ)}&day=${st.day}&event_type_id=${encodeURIComponent(st.type)}`);
-        if (my === st.seq) st.slots = r.slots || [];
+        if (my === st.seq) {
+          if (Array.isArray(r.open_days)) st.openDays = new Set(r.open_days);
+          st.slots = r.day === st.day || !r.day ? r.slots || [] : []; // the server moved off a full day; keep the user's pick
+          drawDays();
+        }
       } catch (e) {
         if (my === st.seq) { st.slots = []; st.err = errText(e) || ERR; }
       }
@@ -641,13 +693,13 @@
     email.addEventListener('input', () => { hint.hidden = true; drawPeople(); update(); });
     email.addEventListener('blur', () => { hint.hidden = !email.value.trim() || EMAIL.test(email.value.trim()); });
 
-    const close = h('button', { class: 'ghost', type: 'button', onclick: () => el.remove() }, 'Close');
+    const close = h('button', { class: 'x', type: 'button', 'aria-label': 'Close', icon: CLOSE, onclick: () => el.remove() });
     const el = h('article', { class: 'card form', 'aria-label': 'New meeting' },
-      h('span', { class: 'title' }, 'New meeting'),
+      h('div', { class: 'fhead' }, h('span', { class: 'title' }, 'New meeting'), close),
       sec('Type', typeRow),
       sec('Who', people, h('div', { class: 'fields' }, name, email), hint),
       sec('When', dayRow, slotRow, time),
-      h('div', { class: 'acts' }, review, close));
+      h('div', { class: 'acts' }, review));
 
     review.onclick = async () => {
       if (st.sent || review.disabled) return;
@@ -739,7 +791,7 @@
   async function send(value, shown) {
     const text = String(value).trim();
     if (!text || S.busy) return;
-    S.busy = true; sendBtn.disabled = true;
+    S.busy = true; sendBtn.disabled = true; syncSuggest();
     if (pendingCancel) await pendingCancel();
     S.tags = {}; S.cands.clear();
     push(h('p', { class: 'me' }, shown || text));
@@ -761,7 +813,7 @@
     try { r = await api('/api/chat', () => ({ message: text, history, open_cards: openCards })); } catch (e) { err = e; }
     keepHistory(r);
     dots.remove();
-    S.busy = false; sendBtn.disabled = false;
+    S.busy = false; sendBtn.disabled = false; syncSuggest();
     if (!r) { if (errText(err)) push(botLine(errText(err))); return; }
     if (!r.confirmed && !keepOpen) {
       // A new request drops any open card on the server; grey them out here too.
@@ -789,6 +841,8 @@
 
   document.querySelector('.top .acct').addEventListener('click', toggleMenu);
   document.addEventListener('click', e => {
+    // A tapped-open availability note closes on the next tap anywhere else.
+    document.querySelectorAll('.note[aria-expanded="true"]').forEach(n => { if (!n.contains(e.target)) n.setAttribute('aria-expanded', 'false'); });
     if (!$('#menu').hidden && !e.target.closest('#menu')) {
       $('#menu').hidden = true;
       document.querySelectorAll('.acct').forEach(b => b.setAttribute('aria-expanded', 'false'));

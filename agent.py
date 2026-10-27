@@ -7,7 +7,7 @@ only create a card; nothing changes in cal.com until the user confirms.
 import json
 import os
 import re
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 import httpx
 from openai import OpenAI
@@ -29,6 +29,8 @@ time, so act first and ask last.
 
 {date_context}
 
+Event types (id: title, minutes): {event_types}
+
 Be proactive:
 - Never ask permission to look something up or to suggest times. Just do it.
 - Never ask a yes/no question you can settle with a tool call.
@@ -36,9 +38,11 @@ Be proactive:
   with that length; for a person named without an email, call find_contacts and use the match if there is one.
 - Never guess or make up an email. Use one the founder typed or one find_contacts returned. If find_contacts finds
   nobody, or more than one person, call open_booking_form so the founder picks.
-- If the requested time is taken or outside availability, call find_slots around it straight away. If you know
-  who and what, call book with the closest open time AND show_options with 2-3 other nearby times, so the
-  founder can book in one tap or switch in one tap. Say it in one line, e.g. "7:00 is taken. 5:30 is the closest."
+- find_slots returns the open times inside the window you asked about ("in_window") and the 4 open times closest
+  to its start ("closest"), searching a week ahead for you, so one call is always enough. If you know who and
+  what: book the requested time if it's in_window, otherwise the first "closest" time, and in the same message
+  call show_options with the other "closest" times (not the one you booked). Say it in one line, e.g.
+  "7:00 is taken. 5:30 is the closest."
 - When the founder taps a time and you know who and what, call book immediately.
 - Only when the person or the time is truly unknown, call open_booking_form with everything you do know.
 
@@ -48,9 +52,14 @@ Rules:
   If the new time for a move is taken, offer the closest open times with show_options straight away.
 - If a request matches no meeting, say so. If it matches more than one, ask which with show_options,
   one option per meeting, value naming the meeting and its time.
+- "Move a meeting" or "Cancel a meeting" with no meeting named: list the next 7 days and show the upcoming
+  meetings with show_options (at most 6, soonest first, label like 'Thu 3:00 PM Investor call'). Reply exactly
+  "Which one?" and nothing else.
 - Never offer or book a time find_slots didn't return.
 - book, reschedule and cancel show the founder a card with a confirm button. Don't ask "shall I go ahead?" in text,
   and don't claim anything is booked, moved or cancelled until you are told it was confirmed.
+- When you call book, reschedule, cancel, show_options or open_booking_form, write your one-line reply in the same
+  message as the tool calls; that ends your turn. Option labels use 12-hour times without AM/PM, like '1:30'.
 - Be brief: one short line. Never mention cards, tools or options by name. List meetings as '3:00 PM Title',
   one per line, no bullets. Use 12-hour times.
 """
@@ -62,8 +71,9 @@ TOOLS = [
      "parameters": {"type": "object", "required": ["start_date", "end_date"], "properties": {
          "start_date": {"type": "string", "description": "YYYY-MM-DD"},
          "end_date": {"type": "string", "description": "YYYY-MM-DD"}}}},
-    {"name": "find_slots", "description": "Free start times for an event type between two local times. "
-                                          "When moving a meeting, pass its uid as reschedule_uid.",
+    {"name": "find_slots", "description": "Open start times for an event type: those inside [start, end) and the 4 "
+                                          "closest to start within a week. When moving a meeting, pass its uid as "
+                                          "reschedule_uid.",
      "parameters": {"type": "object", "required": ["event_type_id", "start", "end"], "properties": {
          "event_type_id": {"type": "integer"},
          "start": {"type": "string", "description": "local YYYY-MM-DDTHH:MM"},
@@ -101,6 +111,17 @@ TOOLS = [
          "uid": {"type": "string"},
          "reason": {"type": "string"}}}},
 ]
+
+
+SHOWS_UI = {"book", "reschedule", "cancel", "show_options", "open_booking_form"}
+
+
+def _default_line(turn: "Turn") -> str:
+    if turn.cards:
+        return {"book": "Book this?", "reschedule": "Move it?", "cancel": "Cancel it?"}[turn.cards[-1]["kind"]]
+    if turn.form:
+        return "Who and when?"
+    return "Which one?"
 
 
 def _local(utc: str, tz: str) -> str:
@@ -165,10 +186,18 @@ class Agent:
                 turn.view = {"start_date": args["start_date"], "end_date": args["end_date"]}
             return {"bookings": [summarize_booking(b, tz) for b in self.cal.bookings(lo, hi)]}
         if name == "find_slots":
-            days = self.cal.slots(args["event_type_id"], timeutil.to_utc(args["start"], tz),
-                                  timeutil.to_utc(args["end"], tz), tz, args.get("reschedule_uid"))
-            starts = [_local(slot["start"], tz) for day in days.values() for slot in day]
-            return {"slots": starts[:12]}
+            # One call covers the asked window's day and the week after, and hands back the closest open times.
+            # Without this the model hunts day by day, which costs rounds and tempts it to guess times.
+            # Normalise to naive local time so a model-supplied offset or Z compares with the slot strings.
+            want_lo, want_hi = (datetime.fromisoformat(_local(timeutil.to_utc(args[k], tz), tz))
+                                for k in ("start", "end"))
+            day = want_lo.date().isoformat()
+            lo, hi = timeutil.day_range_utc(day, (want_lo.date() + timedelta(days=7)).isoformat(), tz)
+            days = self.cal.slots(args["event_type_id"], lo, hi, tz, args.get("reschedule_uid"))
+            starts = sorted(_local(slot["start"], tz) for d in days.values() for slot in d)
+            in_window = [x for x in starts if want_lo <= datetime.fromisoformat(x) < want_hi]
+            closest = sorted(starts, key=lambda x: abs(datetime.fromisoformat(x) - want_lo))[:4]
+            return {"in_window": in_window[:12], "closest": closest}
         if name == "show_options":
             turn.options = [{"label": o["label"], "value": o["value"]} for o in args["options"]][:6]
             return {"shown": len(turn.options)}
@@ -215,17 +244,31 @@ class Agent:
     # ---- quick-fill booking ----
 
     def booking_form(self, tz: str, day: str, event_type_id: int | None = None) -> dict:
-        """Everything the quick-fill card offers as taps: meeting types, recent contacts, the day's open times."""
+        """Everything the quick-fill card offers as taps: meeting types, recent contacts, and the founder's open
+        times. One slots call covers the next 14 days, so the card can grey out full days and open on a free one."""
         types = [{"id": e["id"], "title": e["title"], "minutes": e["lengthInMinutes"]} for e in self.cal.event_types()]
         if event_type_id not in {t["id"] for t in types}:
             event_type_id = types[0]["id"] if types else None
-        slots = []
+        by_day: dict[str, list[str]] = {}
         if event_type_id is not None:
-            lo, hi = timeutil.day_range_utc(day, day, tz)
-            days = self.cal.slots(event_type_id, lo, hi, tz)
-            slots = [_local(slot["start"], tz) for d in days.values() for slot in d]
+            # Always one 14-day window: from today when the asked day falls inside it (so every day chip is
+            # covered), otherwise from the asked day. A past day is clamped to today; a stray year can't
+            # turn into a years-long request.
+            today = timeutil.now_local(tz).date()
+            asked_d = max(date.fromisoformat(day), today)
+            first = today if asked_d <= today + timedelta(days=13) else asked_d
+            lo, hi = timeutil.day_range_utc(first.isoformat(), (first + timedelta(days=13)).isoformat(), tz)
+            for d in self.cal.slots(event_type_id, lo, hi, tz).values():
+                for slot in d:
+                    start = _local(slot["start"], tz)
+                    by_day.setdefault(start[:10], []).append(start)
+        open_days = sorted(by_day)
+        asked = day
+        if not by_day.get(day):
+            # A full day is a dead end. Land on the next day the founder is free instead.
+            day = next((d for d in open_days if d >= asked), asked)
         return {"event_types": types, "event_type_id": event_type_id, "contacts": self.contacts(tz),
-                "day": day, "slots": slots}
+                "day": day, "asked_day": asked, "open_days": open_days, "slots": by_day.get(day, [])}
 
     def contacts(self, tz: str, limit: int = 8) -> list[dict]:
         """People the founder books with, most often first, then most recent. cal.com's booking history is
@@ -269,8 +312,10 @@ class Agent:
         return self._turn(s)
 
     def _turn(self, s: store.Session) -> dict:
+        # Event types go in up front: it saves the model a round trip on almost every booking.
+        types = "; ".join(f"{e['id']}: {e['title']}, {e['lengthInMinutes']}" for e in self.cal.event_types()) or "none"
         system = {"role": "system", "content": SYSTEM.format(
-            date_context=timeutil.date_context(s.tz), tz=s.tz)}
+            date_context=timeutil.date_context(s.tz), tz=s.tz, event_types=types)}
         turn = Turn()
         mark = len(s.messages)
         try:
@@ -288,9 +333,17 @@ class Agent:
                 s.messages.append(msg.model_dump(exclude_none=True, include={"role", "content", "tool_calls"}))
                 if not msg.tool_calls:
                     return self._out(msg.content or "", turn)
+                results = []
                 for call in msg.tool_calls:
                     result = self._safe_tool(s, turn, call.function.name, call.function.arguments)
+                    results.append((call.function.name, result))
                     s.messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+                # Once everything this round put something on screen for the founder, the turn is done.
+                # Another model call would only write a line the founder doesn't need, and cost a second or two.
+                if all(n in SHOWS_UI and "error" not in r for n, r in results):
+                    reply = (msg.content or "").strip() or _default_line(turn)
+                    s.messages.append({"role": "assistant", "content": reply})  # so the next turn sees what was said
+                    return self._out(reply, turn)
             return self._out("That took too many steps. Can you say it another way?", turn)
         except Exception:
             # Roll the turn back so a half-written tool exchange can't poison every later request.
@@ -315,7 +368,7 @@ class Agent:
 
     @staticmethod
     def _out(reply: str, turn: Turn) -> dict:
-        return {"reply": reply, "cards": turn.cards, "options": turn.options, "view": turn.view, "form": turn.form}
+        return {"reply": reply.strip(), "cards": turn.cards, "options": turn.options, "view": turn.view, "form": turn.form}
 
     # ---- confirm ----
 

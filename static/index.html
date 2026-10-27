@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schedule</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&amp;family=DotGothic16&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="connect dots" id="connect" hidden>
+  <div class="intro">
+    <h1>Say It. It's Booked.</h1>
+    <p>Connect your cal.com account to book, move and cancel from chat.</p>
+    <a class="cta" href="/api/auth/login"><span><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 7h8M7.5 3.5L11 7l-3.5 3.5" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Connect cal.com</a>
+  </div>
+</main>
+<div class="app" id="app" hidden>
+  <header class="top">Schedule<button class="acct" type="button" aria-label="Account" aria-haspopup="true" aria-expanded="false"></button></header>
+  <div class="menu" id="menu" hidden><span class="who" id="who"></span><button type="button" id="signout">Sign out</button></div>
+  <div class="main">
+    <section class="panel" id="panel" aria-label="Today"></section>
+    <section class="chat dots" id="chat" aria-label="Assistant">
+      <div class="log" id="log" aria-live="polite">
+        <div class="stack" id="stack">
+          <div class="intro" id="intro">
+            <h1>Say It. It's Booked.</h1>
+            <p>Book, move or cancel on cal.com. I'll check with you first.</p>
+            <button class="opt" type="button" data-say="Book a 30-min intro Thursday afternoon">Book a 30-min intro Thursday afternoon<span class="arrow"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 7h8M7.5 3.5L11 7l-3.5 3.5" stroke="#050DC8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+            <button class="opt" type="button" data-say="What's on tomorrow?">What's on tomorrow?<span class="arrow"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M3 7h8M7.5 3.5L11 7l-3.5 3.5" stroke="#050DC8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>
+          </div>
+        </div>
+      </div>
+      <form class="composer" id="form" autocomplete="off">
+        <div class="input">
+          <label for="ask" class="sr">Message the assistant</label>
+          <input id="ask" maxlength="2000" placeholder="Book, move or cancel…" enterkeyhint="send">
+          <button class="send" id="send" type="submit" aria-label="Send"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5" stroke="#050DC8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        </div>
+      </form>
+    </section>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

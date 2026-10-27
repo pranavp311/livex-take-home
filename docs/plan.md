@@ -33,7 +33,7 @@ The browser sends its IANA time zone with every message. The system prompt gets 
 
 ### Tools
 
-Headers on every call: `Authorization: Bearer $CAL_API_KEY` and a `cal-api-version` that differs per endpoint. Versions come from cal.com's OpenAPI spec (`calcom/cal.com`, `docs/api-reference/v2/openapi.json`), which is what the request and response shapes in `calcom.py` follow. The docs site shows newer bookings versions (`2026-05-01`, `2026-02-25`); we stay on the spec's until a live call says otherwise.
+Headers on every call: `Authorization: Bearer <visitor's OAuth access token>` and a `cal-api-version` that differs per endpoint. Versions come from cal.com's OpenAPI spec (`calcom/cal.com`, `docs/api-reference/v2/openapi.json`), which is what the request and response shapes in `calcom.py` follow. The docs site shows newer bookings versions (`2026-05-01`, `2026-02-25`); we stay on the spec's until a live call says otherwise.
 
 | Tool | cal.com endpoint | `cal-api-version` |
 |---|---|---|
@@ -62,7 +62,7 @@ static/       the UI
 tests/
 ```
 
-Keys come from `.env`: `LIVEX_OPENROUTER_API_KEY`, `CAL_API_KEY`.
+Secrets come from env (`.env` locally, Vercel project settings in production): `LIVEX_OPENROUTER_API_KEY`, `CAL_OAUTH_CLIENT_ID`, `CAL_OAUTH_CLIENT_SECRET`, plus `KV_REST_API_URL` and `KV_REST_API_TOKEN` from the Upstash store. There is no personal cal.com API key; every visitor signs in with their own cal.com account.
 
 ### Build order
 
@@ -97,3 +97,77 @@ What changes when real founders use it:
 
 - The docs site and the OpenAPI spec disagree on the bookings `cal-api-version`. Confirm on the first live call.
 - Undo after cancel only works if the backend holds the cancel call for a few seconds, because cal.com emails attendees straight away. The take-home skips undo unless there's time.
+
+## Implementation (take-home, round 2)
+
+This round wires the approved Version B design to the backend. The frontend is plain HTML, CSS and JS in `static/`, served by FastAPI, with no build step. The styles are ported from the design files.
+
+### API contract
+
+```
+POST /api/chat     {session_id, message, tz}
+                -> {reply, cards: [Card], options: [{label, value}], view: {start_date, end_date} | null,
+                    confirmed?: ConfirmResult}
+POST /api/confirm  {session_id, change_id, tz} -> ConfirmResult
+POST /api/undo     {session_id, change_id, tz} -> {ok, message}
+GET  /api/schedule ?tz=&day=YYYY-MM-DD&days=1  -> {bookings: [{uid, title, start, end, attendees, event_type_id}]}
+
+Card          {change_id, kind: book|reschedule|cancel, title, attendee, minutes, old_start, new_start}
+ConfirmResult {ok, message, card?, undo_seconds?, followup?: <chat response>}
+```
+
+All times the browser sees are local `YYYY-MM-DDTHH:MM`.
+
+### Backend additions
+
+- `show_options` tool. The model uses it to render slot chips and "which one?" buttons. A tap sends the option's `value` as the next user message.
+- `view`. When the model lists a single day's bookings, the response names that day, and the today panel switches to it with a "Today" pill to return.
+- Undo. Confirming a cancel starts an 8-second timer instead of calling cal.com. `/api/undo` stops the timer. When the timer fires, the cancel goes out and the attendee gets the email.
+- A failed confirm runs one more model turn, so the bot explains and offers fresh times in the same response (`followup`).
+
+Fixes from the backend review:
+- A tool error the code didn't expect (timeout, malformed arguments) becomes an error result for the model, so every tool call gets a reply. Anything else rolls the turn's history back and drops the turn's cards before re-raising, so one bad turn can't wedge the session.
+- Confirm reports a cal.com timeout as "cal.com didn't answer, check your calendar", because the write may have gone through.
+- Only "y" or "yes" confirms by text, in both app and CLI. "ok" could mean "go on", and a cancel can't be taken back.
+- A lock per session, so a confirm can't land in the middle of a chat turn's tool calls.
+- Card times come from the converted UTC time, so a time that doesn't exist across a DST change shows what will actually be booked.
+- The booking uid is URL-escaped before it goes into a path.
+
+### Frontend, screen by screen
+
+| Design frame | What drives it |
+|---|---|
+| Main: today panel + chat | `GET /api/schedule` on load, every minute, and after each confirm or undo |
+| First run / empty day | Schedule returns no bookings |
+| Book: confirm, booked, slot taken | `cards` (pending slot dashed on the panel), `/api/confirm`, `followup` |
+| Reschedule: which one, confirm, moved | `options`, `cards`, `/api/confirm` |
+| Cancel: confirm, cancelled + undo | `cards`, `/api/confirm` with `undo_seconds`, `/api/undo` |
+| View a day | `view` |
+| Thinking | While `/api/chat` is in flight |
+| Phone | CSS breakpoint at 720px: the panel becomes a top strip with a "Today" toggle |
+
+Motion follows the design's Motion frame: 150-300 ms, no bounce, and `prefers-reduced-motion` turns movement off.
+
+### Checks
+
+- pytest for every review fix and the new tools.
+- Sign in on the Vercel deployment as a fresh user, then book, move and cancel with undo, each checked in cal.com.
+- Playwright screenshots at 1280 and 390 px wide, compared against the design frames.
+
+## Round 3: Vercel and cal.com sign-in
+
+Hosting is Vercel (personal team `pranavp311s-projects`, project `livex-take-home`, auto-deploys from `main`). Testers just open the link and sign in with their own cal.com account. Nothing to install.
+
+The server keeps no state, so any serverless instance can answer any request:
+
+- The browser holds the chat history and open cards and sends them with each request. The server checks them (only user, assistant and tool messages; 60 messages or 100 KB at most) so the history can't swap the system prompt or bulk-spend the OpenRouter key.
+- The cal.com tokens live in an httpOnly `cal_tokens` cookie. Tokens refresh a minute before their 30-minute expiry, and a middleware writes the new pair back on every response, failed ones included, because cal.com may retire the old refresh token.
+- A card running once is now the browser's job: the button disables on the first tap. That's the take-home trade-off for having no server storage.
+- Undo lives in the browser: "Cancel it" starts an 8-second toast, and the browser calls `/api/confirm` only when it runs out. Closing the tab inside those 8 seconds cancels nothing.
+- The browser sends one request at a time, so two requests never refresh the token at once.
+
+Sign-in (`auth.py`): `/api/auth/login` redirects to cal.com with a `state` cookie, `/api/auth/callback` checks it and swaps the code for tokens. The redirect URI comes from `PUBLIC_URL`, never from the request, because cal.com matches it exactly. Scopes: `EVENT_TYPE_READ BOOKING_READ BOOKING_WRITE SCHEDULE_READ PROFILE_READ`. Registered redirect URIs: `https://livex-take-home.vercel.app/api/auth/callback` and `http://localhost:8000/api/auth/callback`. The cal.com OAuth client stays "pending" until a cal.com admin approves it; until then only its owner can sign in.
+
+Model: DeepSeek thinking is turned off. With it on, DeepSeek rejects any tool turn whose reasoning isn't passed back, and it's slower. Verified with a live two-turn tool call.
+
+Vercel env (production): `LIVEX_OPENROUTER_API_KEY`, `CAL_OAUTH_CLIENT_ID`, `CAL_OAUTH_CLIENT_SECRET`, `PUBLIC_URL`.

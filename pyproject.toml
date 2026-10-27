@@ -1,0 +1,18 @@
+[project]
+name = "livex-take-home"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "openai",
+    "python-dotenv",
+    "tzdata>=2026.5",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

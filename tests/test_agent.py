@@ -25,6 +25,7 @@ class FakeCal:
         self.requests = []
         self.fail_writes = fail_writes
         self.timeout_writes = False
+        self.write_reply = {"uid": "new", "start": "2026-10-29T21:00:00Z"}
         self.timeout_reads = False
 
     def handler(self, req: httpx.Request) -> httpx.Response:
@@ -35,7 +36,7 @@ class FakeCal:
         if req.method == "POST":
             if self.fail_writes:
                 return httpx.Response(400, json={"status": "error", "error": {"message": "slot taken"}})
-            return httpx.Response(201, json={"status": "success", "data": {"uid": "new"}})
+            return httpx.Response(201, json={"status": "success", "data": self.write_reply})
         if path == "/v2/me":
             return httpx.Response(200, json={"data": {"username": "founder"}})
         if path == "/v2/event-types":
@@ -336,3 +337,32 @@ def test_fast_turn_keeps_its_reply_in_history():
     agent, fake, s = make([("show_options", {"options": [{"label": "a", "value": "a"}]})])
     agent.chat(s, "move a meeting")
     assert s.messages[-1] == {"role": "assistant", "content": "Which one?"}
+
+
+def test_after_a_move_the_bot_learns_the_new_booking_id():
+    # cal.com gives a moved meeting a new uid. "Cancel it" right after must target the new one.
+    agent, fake, s = make([("reschedule", {"uid": "bk_1", "new_start": "2026-10-28T17:00"})])
+    fake.write_reply = {"uid": "bk_2", "start": "2026-10-29T00:00:00Z"}
+    card = agent.chat(s, "move my 3pm to 5pm")["cards"][0]
+    agent.confirm(s, card["change_id"])
+    assert "uid is now bk_2" in s.messages[-1]["content"]
+
+
+def test_acting_on_a_moved_meeting_follows_it_to_the_current_booking():
+    agent, fake, s = make([("cancel", {"uid": "bk_old"})])
+    moved = {**BOOKING, "uid": "bk_old", "status": "cancelled", "rescheduledToUid": "bk_1"}
+    real = agent.cal.booking
+    agent.cal.booking = lambda uid: moved if uid == "bk_old" else real(uid)
+    card = agent.chat(s, "cancel it")["cards"][0]
+    assert card["args"]["uid"] == "bk_1"
+
+
+def test_moving_never_offers_the_meetings_current_time():
+    # The booking is at 15:00 local on 10-28; cal.com marks that slot open when rescheduling it.
+    agent, fake, s = make([("find_slots", {"event_type_id": 7, "start": "2026-10-28T15:00",
+                                           "end": "2026-10-28T18:00", "reschedule_uid": "bk_1"}), "ok"])
+    agent.cal.slots = lambda et, lo, hi, tz, uid=None: {"2026-10-28": [
+        {"start": "2026-10-28T22:00:00Z"}, {"start": "2026-10-28T22:30:00Z"}]}
+    agent.chat(s, "move it")
+    result = json.loads(next(m for m in s.messages if m["role"] == "tool")["content"])
+    assert "2026-10-28T15:00" not in result["closest"] and result["closest"] == ["2026-10-28T15:30"]

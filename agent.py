@@ -48,8 +48,10 @@ Be proactive:
 
 Rules:
 - Times you read and write are local to the founder ({tz}), as 'YYYY-MM-DDTHH:MM'.
-- To move or cancel a meeting, call list_bookings first and use the uid it returns. Never guess a uid.
-  If the new time for a move is taken, offer the closest open times with show_options straight away.
+- To move or cancel a meeting, use the uid from list_bookings or from the latest [system] note. Never guess a uid.
+- Moves work like bookings: call find_slots with reschedule_uid, then call reschedule with the requested time if
+  it's in_window, otherwise the closest time, and show_options with the other closest times. Never offer the
+  meeting's current time.
 - If a request matches no meeting, say so. If it matches more than one, ask which with show_options,
   one option per meeting, value naming the meeting and its time.
 - "Move a meeting" or "Cancel a meeting" with no meeting named: list the next 7 days and show the upcoming
@@ -60,6 +62,7 @@ Rules:
   and don't claim anything is booked, moved or cancelled until you are told it was confirmed.
 - When you call book, reschedule, cancel, show_options or open_booking_form, write your one-line reply in the same
   message as the tool calls; that ends your turn. Option labels use 12-hour times without AM/PM, like '1:30'.
+- Never repeat the option times in your text; the founder sees them as buttons.
 - Be brief: one short line. Never mention cards, tools or options by name. List meetings as '3:00 PM Title',
   one per line, no bullets. Use 12-hour times.
 """
@@ -193,8 +196,12 @@ class Agent:
                                 for k in ("start", "end"))
             day = want_lo.date().isoformat()
             lo, hi = timeutil.day_range_utc(day, (want_lo.date() + timedelta(days=7)).isoformat(), tz)
-            days = self.cal.slots(args["event_type_id"], lo, hi, tz, args.get("reschedule_uid"))
+            moving = self._current(args["reschedule_uid"]) if args.get("reschedule_uid") else None
+            days = self.cal.slots(args["event_type_id"], lo, hi, tz, moving and moving["uid"])
             starts = sorted(_local(slot["start"], tz) for d in days.values() for slot in d)
+            if moving:
+                # cal.com lists the meeting's own slot as open when moving it; offering it would be a no-op move.
+                starts = [x for x in starts if x != _local(moving["start"], tz)]
             in_window = [x for x in starts if want_lo <= datetime.fromisoformat(x) < want_hi]
             closest = sorted(starts, key=lambda x: abs(datetime.fromisoformat(x) - want_lo))[:4]
             return {"in_window": in_window[:12], "closest": closest}
@@ -224,7 +231,7 @@ class Agent:
                 # Shown from the converted time, so a wall time skipped by DST shows what will really be booked.
                 "old_start": None, "new_start": _local(start, tz)})
         elif name in ("reschedule", "cancel"):
-            raw = self.cal.booking(args["uid"])
+            raw = self._current(args["uid"])
             b = summarize_booking(raw, tz)
             common = {"title": b["title"], "attendee": ", ".join(b["attendees"]), "minutes": _minutes(raw),
                       "old_start": b["start"]}
@@ -240,6 +247,19 @@ class Agent:
             return {"error": f"unknown tool {name}"}
         turn.cards.append(change.card)
         return {"card_shown": change.card}
+
+    def _current(self, uid: str) -> dict:
+        """The live booking for a uid. A moved meeting's old record points at its replacement, so follow it;
+        acting on the old one would cancel or move a meeting that no longer exists."""
+        raw = self.cal.booking(uid)
+        for _ in range(5):
+            nxt = raw.get("rescheduledToUid")
+            if not nxt:
+                break
+            raw = self.cal.booking(nxt)
+        if raw.get("status") in ("cancelled", "rejected"):
+            raise CalComError(410, "That meeting is already cancelled.")
+        return raw
 
     # ---- quick-fill booking ----
 
@@ -383,11 +403,11 @@ class Agent:
         a = change.args
         try:
             if change.kind == "book":
-                self.cal.create_booking(a["event_type_id"], a["start"], a["name"], a["email"], s.tz)
+                made = self.cal.create_booking(a["event_type_id"], a["start"], a["name"], a["email"], s.tz)
             elif change.kind == "reschedule":
-                self.cal.reschedule(a["uid"], a["start"])
+                made = self.cal.reschedule(a["uid"], a["start"])
             else:
-                self.cal.cancel(a["uid"], a["reason"])
+                made = self.cal.cancel(a["uid"], a["reason"])
         except (CalComError, httpx.HTTPError) as e:
             # A timeout may still have gone through, so never offer a blind retry.
             reason = e.message if isinstance(e, CalComError) else \
@@ -397,5 +417,11 @@ class Agent:
                                "Tell the founder briefly and offer fresh times if it was a slot problem."})
             return {"ok": False, "message": reason, "followup": self._turn(s)}
         done = {"book": "Booked", "reschedule": "Moved", "cancel": "Cancelled"}[change.kind]
-        s.messages.append({"role": "user", "content": f"[system] The founder confirmed. {done}: {title}."})
+        note = f"[system] The founder confirmed. {done}: {title}."
+        if change.kind != "cancel" and isinstance(made, dict) and made.get("uid"):
+            # cal.com gives a moved meeting a new uid. Without it the model would act on the old record next time.
+            # The write already happened here, so nothing in this note may raise.
+            note += f" Its uid is now {made['uid']}"
+            note += f", starting {_local(made['start'], s.tz)}." if made.get("start") else "."
+        s.messages.append({"role": "user", "content": note})
         return {"ok": True, "message": f"{done}.", "card": change.card}

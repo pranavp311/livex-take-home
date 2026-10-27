@@ -394,9 +394,11 @@
     const title = h('span', { class: 'title' }, c.title);
     let detail = null;
     if (c.kind === 'reschedule') {
-      const sameDay = c.old_start.slice(0, 10) === c.new_start.slice(0, 10) && dayLabel(c.new_start.slice(0, 10)) === 'Today';
+      // Same day: say the day once under the title and keep each box to just its times, so neither wraps.
+      const day = c.new_start.slice(0, 10);
+      const sameDay = c.old_start.slice(0, 10) === day;
       const lbl = s => (sameDay ? '' : `${dayLabel(s.slice(0, 10))} · `) + range(minOf(s), cardEnd(s, c));
-      el.append(title, h('div', { class: 'swap' },
+      el.append(h('div', { class: 'head' }, title, sameDay ? h('span', { class: 'sub' }, dayLabel(day)) : null), h('div', { class: 'swap' },
         h('div', { class: 'old' }, h('span', { class: 't' }, lbl(c.old_start))),
         icon(SWAP),
         h('div', { class: 'new' }, h('span', { class: 't' }, lbl(c.new_start)))));

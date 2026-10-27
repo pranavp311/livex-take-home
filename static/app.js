@@ -168,8 +168,9 @@
       m.when = range(next.s, next.e);
       m.what = next.title;
     } else if (isToday) {
-      m.when = now < Math.max(1080, last) ? `Open until ${hm(Math.max(1080, last))} ${ap(Math.max(1080, last))}` : 'Day done';
-      m.what = real.length ? 'Nothing else today' : 'No meetings today';
+      // No hour here: the founder's working hours live in cal.com, and guessing "6 PM" was wrong for most people.
+      m.when = 'Rest of today';
+      m.what = real.length ? 'Nothing else booked' : 'No meetings';
     } else {
       m.when = real.length ? rangeAP(real[0].s, last) : 'Nothing booked';
       m.what = real.length ? `${real.length} meeting${real.length > 1 ? 's' : ''}` : 'No meetings';

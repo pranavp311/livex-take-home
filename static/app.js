@@ -201,6 +201,7 @@
       h('h2', null, weekday(S.day)));
     if (m.isToday && m.left > 0) head.append(h('span', { class: 'left' }, h('b', null, String(m.left)), ' left today'));
     if (!m.isToday) head.append(h('button', { class: 'pill', type: 'button', onclick: () => loadSchedule(todayStr()) }, 'Today'));
+    head.append(h('button', { class: 'pill new', type: 'button', onclick: openNew }, 'New'));
     head.append(acctButton()); // phone only; the desktop one sits in the header
 
     const nx = m.next;
@@ -388,7 +389,8 @@
       let sub = cardWhen(start, c, true);
       if (c.kind === 'cancel' && c.attendee) sub += ` · ${String(c.attendee).split(' ')[0]} will be told`;
       el.append(h('div', { class: 'head' }, title, h('span', { class: 'sub' }, sub)));
-      if (c.kind === 'book' && c.attendee) detail = `${c.minutes} min · invite to ${c.attendee}`;
+      // The email is shown so a wrong address can be caught before the invite goes out.
+      if (c.kind === 'book' && c.attendee) detail = `${c.minutes} min · invite to ${c.attendee}${c.email ? ` · ${c.email}` : ''}`;
     }
     const primary = c.kind === 'cancel'
       ? h('button', { class: 'ink', type: 'button' }, 'Cancel it')
@@ -540,6 +542,176 @@
   }
   let pendingCancel = null; // sends a held cancel now, so a new message can't expire its card on the server
 
+  // ---------- quick-fill booking form ----------
+  const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const SLOTS_SHOWN = 8;
+  function nextDays() {
+    const d = toDate(todayStr()), out = [ymd(d)];
+    d.setDate(d.getDate() + 1); out.push(ymd(d));
+    while (out.length < 7) { d.setDate(d.getDate() + 1); if (d.getDay() % 6) out.push(ymd(d)); }
+    return out;
+  }
+  function chipDay(s) {
+    const l = dayLabel(s);
+    if (l === 'Today' || l === 'Tomorrow') return l;
+    const d = toDate(s);
+    return `${d.toLocaleDateString('en-US', { weekday: 'short' })} ${d.getDate()}`;
+  }
+
+  let opening = false;
+  async function openNew() {
+    const open = stack.querySelector('.card.form');
+    if (open) { open.scrollIntoView({ block: 'nearest' }); return; }
+    if (opening) return;
+    opening = true;
+    try { addForm(await api(`/api/booking-form?tz=${encodeURIComponent(TZ)}`)); }
+    catch (e) { if (errText(e)) push(botLine(errText(e))); }
+    opening = false;
+  }
+
+  function addForm(f) {
+    const pre = f.prefill || {};
+    const types = f.event_types || [];
+    const st = {
+      type: (types.find(t => t.id === pre.event_type_id) || types[0] || {}).id,
+      day: f.day || pre.day || todayStr(), slots: f.slots || [], slot: null,
+      other: false, more: false, loading: false, err: '', seq: 0, sent: false,
+    };
+    const chip = (label, on, onclick, title) => h('button', { class: on ? 'chip on' : 'chip', type: 'button', 'aria-pressed': String(on), title, onclick }, label);
+    const sec = (label, ...kids) => h('div', { class: 'sec' }, h('span', { class: 'lab' }, label), ...kids);
+
+    const typeRow = h('div', { class: 'chips' });
+    const drawTypes = () => typeRow.replaceChildren(...types.map(t =>
+      chip(t.title, t.id === st.type, () => { if (st.type === t.id) return; st.type = t.id; drawTypes(); refetch(); }, `${t.minutes} min`)));
+
+    const name = h('input', { type: 'text', autocomplete: 'name', placeholder: 'Name', 'aria-label': 'Name', maxlength: '200' });
+    const email = h('input', { type: 'email', autocomplete: 'email', placeholder: 'Email', 'aria-label': 'Email', maxlength: '200' });
+    name.value = pre.name || '';
+    email.value = pre.email || '';
+    const hint = h('span', { class: 'hint', hidden: true }, 'Check the email address.');
+    const people = h('div', { class: 'chips' });
+    const drawPeople = () => people.replaceChildren(...(f.contacts || []).map(c =>
+      chip(c.name || c.email, name.value === (c.name || '') && email.value === c.email, () => {
+        name.value = c.name || ''; email.value = c.email || ''; hint.hidden = true; drawPeople(); update();
+      }, c.email)));
+
+    const days = nextDays();
+    if (!days.includes(st.day)) days.push(st.day);
+    const dayRow = h('div', { class: 'chips' });
+    const drawDays = () => dayRow.replaceChildren(...days.map(d =>
+      chip(chipDay(d), d === st.day, () => { if (st.day === d) return; st.day = d; drawDays(); refetch(); })));
+
+    const time = h('input', { type: 'time', 'aria-label': 'Other time', step: '300' });
+    time.addEventListener('input', update);
+    const slotRow = h('div', { class: 'chips' });
+    function drawSlots() {
+      const kids = [];
+      if (st.loading) kids.push(h('span', { class: 'hint' }, 'Finding open times…'));
+      else if (st.err) kids.push(h('span', { class: 'hint' }, st.err));
+      else if (!st.slots.length) kids.push(h('span', { class: 'hint' }, 'No open times. Pick another day.'));
+      else {
+        const shown = st.more ? st.slots : st.slots.slice(0, SLOTS_SHOWN);
+        for (const sl of shown) kids.push(chip(hm(minOf(sl)), !st.other && st.slot === sl, () => { st.slot = sl; st.other = false; drawSlots(); update(); }));
+        if (!st.more && st.slots.length > SLOTS_SHOWN) kids.push(chip(`+${st.slots.length - SLOTS_SHOWN} more`, false, () => { st.more = true; drawSlots(); }));
+      }
+      kids.push(chip('Other time', st.other, () => { st.other = !st.other; st.slot = null; drawSlots(); update(); if (st.other) time.focus(); }));
+      slotRow.replaceChildren(...kids);
+      time.hidden = !st.other;
+    }
+    async function refetch() {
+      const my = ++st.seq;
+      Object.assign(st, { loading: true, err: '', slot: null, more: false });
+      drawSlots(); update();
+      try {
+        const r = await api(`/api/booking-form?tz=${encodeURIComponent(TZ)}&day=${st.day}&event_type_id=${encodeURIComponent(st.type)}`);
+        if (my === st.seq) st.slots = r.slots || [];
+      } catch (e) {
+        if (my === st.seq) { st.slots = []; st.err = errText(e) || ERR; }
+      }
+      if (my === st.seq) { st.loading = false; drawSlots(); update(); }
+    }
+
+    const start = () => (st.other ? (time.value ? `${st.day}T${time.value.slice(0, 5)}` : null) : st.slot);
+    const review = h('button', { class: 'cta', type: 'button', disabled: true }, icon(ARROW), 'Review');
+    function update() {
+      const ok = st.type != null && name.value.trim() && EMAIL.test(email.value.trim()) && start();
+      review.disabled = !ok || st.sent;
+    }
+    name.addEventListener('input', () => { drawPeople(); update(); });
+    email.addEventListener('input', () => { hint.hidden = true; drawPeople(); update(); });
+    email.addEventListener('blur', () => { hint.hidden = !email.value.trim() || EMAIL.test(email.value.trim()); });
+
+    const close = h('button', { class: 'ghost', type: 'button', onclick: () => el.remove() }, 'Close');
+    const el = h('article', { class: 'card form', 'aria-label': 'New meeting' },
+      h('span', { class: 'title' }, 'New meeting'),
+      sec('Type', typeRow),
+      sec('Who', people, h('div', { class: 'fields' }, name, email), hint),
+      sec('When', dayRow, slotRow, time),
+      h('div', { class: 'acts' }, review, close));
+
+    review.onclick = async () => {
+      if (st.sent || review.disabled) return;
+      st.sent = true; // a form card submits once
+      el.querySelectorAll('button, input').forEach(x => { x.disabled = true; });
+      const body = { event_type_id: st.type, start: start(), name: name.value.trim(), email: email.value.trim() };
+      let r;
+      // Propose writes nothing, so a failed one can simply be tried again from the same card.
+      const reopen = msg => {
+        st.sent = false;
+        el.querySelectorAll('button, input').forEach(x => { x.disabled = false; });
+        update();
+        if (msg) push(botLine(msg));
+      };
+      try { r = await api('/api/propose', () => ({ ...body, history })); } catch (e) { reopen(errText(e)); return; }
+      keepHistory(r);
+      if (!r.ok) { reopen(r.message || "That didn't go through. Try again."); return; }
+      const s = minOf(body.start);
+      el.replaceWith(h('div', { class: 'done', role: 'status' }, h('span', null, `New meeting · ${body.name}`),
+        h('span', { class: 't when' }, `${chipDay(body.start.slice(0, 10))} · ${hm(s)} ${ap(s)}`)));
+      renderResponse({ reply: '', cards: r.cards || [], options: [] });
+    };
+
+    drawTypes(); drawPeople(); drawDays(); drawSlots(); update();
+    push(el);
+    // On a phone the card is taller than the chat; show its top (Type) rather than its bottom.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (el.offsetHeight > log.clientHeight) el.scrollIntoView({ block: 'start' });
+    }));
+    if (!f.slots && st.type != null) refetch();
+  }
+
+  // ---------- voice input ----------
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const mic = $('#mic');
+  let stopMic = () => {};
+  if (!SR) mic.remove();
+  else {
+    let rec = null;
+    // Sending ends dictation, so a late result can't refill the box with what was just sent.
+    stopMic = () => { if (rec) { const r = rec; rec = null; setRec(false); r.abort(); } };
+    const setRec = on => { mic.setAttribute('aria-pressed', String(on)); };
+    mic.addEventListener('click', () => {
+      if (rec) { rec.stop(); return; }
+      const r = new SR();
+      r.interimResults = true;
+      r.lang = navigator.language;
+      const base = input.value.trim();
+      r.onresult = e => {
+        let text = '', final = false;
+        for (let i = 0; i < e.results.length; i++) { text += e.results[i][0].transcript; if (e.results[i].isFinal) final = true; }
+        input.value = ((base ? base + ' ' : '') + text.trim()).slice(0, 2000);
+        if (final) r.stop();
+      };
+      r.onerror = e => {
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') push(botLine('Mic blocked. Allow it in your browser to talk.'));
+      };
+      r.onend = () => { if (rec === r) { rec = null; setRec(false); input.focus(); } };
+      rec = r;
+      setRec(true);
+      try { r.start(); } catch (e) { rec = null; setRec(false); }
+    });
+  }
+
   // ---------- send / render a chat response ----------
   function renderResponse(r) {
     if (r.confirmed) {
@@ -555,6 +727,7 @@
       if (opts.length) addOptions(b, opts);
       push(b);
     }
+    if (r.form) addForm(r.form);
     cards.forEach(addCard);
     const last = cards[cards.length - 1];
     const day = (r.view && r.view.start_date) || (last && (last.kind === 'cancel' ? last.old_start : last.new_start) || '').slice(0, 10);
@@ -604,6 +777,7 @@
   $('#form').addEventListener('submit', e => {
     e.preventDefault();
     if (S.busy) return;
+    stopMic();
     const v = input.value;
     input.value = '';
     send(v);

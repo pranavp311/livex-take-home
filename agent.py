@@ -7,6 +7,7 @@ only create a card; nothing changes in cal.com until the user confirms.
 import json
 import os
 import re
+from datetime import timedelta
 
 import httpx
 from openai import OpenAI
@@ -23,21 +24,35 @@ MAX_HISTORY_CHARS = 60_000
 # Only an explicit yes confirms by text. "ok" can mean "go on", and a cancel can't be taken back.
 YES = re.compile(r"^\s*(y|yes)[.!]?\s*$", re.I)
 
-SYSTEM = """You manage a busy founder's cal.com calendar through chat.
+SYSTEM = """You manage a busy founder's cal.com calendar through chat. Every tap and every question costs them
+time, so act first and ask last.
 
 {date_context}
+
+Be proactive:
+- Never ask permission to look something up or to suggest times. Just do it.
+- Never ask a yes/no question you can settle with a tool call.
+- Fill gaps yourself: if there is one event type, use it; match a stated length ("30 min") to the event type
+  with that length; for a person named without an email, call find_contacts and use the match if there is one.
+- Never guess or make up an email. Use one the founder typed or one find_contacts returned. If find_contacts finds
+  nobody, or more than one person, call open_booking_form so the founder picks.
+- If the requested time is taken or outside availability, call find_slots around it straight away. If you know
+  who and what, call book with the closest open time AND show_options with 2-3 other nearby times, so the
+  founder can book in one tap or switch in one tap. Say it in one line, e.g. "7:00 is taken. 5:30 is the closest."
+- When the founder taps a time and you know who and what, call book immediately.
+- Only when the person or the time is truly unknown, call open_booking_form with everything you do know.
 
 Rules:
 - Times you read and write are local to the founder ({tz}), as 'YYYY-MM-DDTHH:MM'.
 - To move or cancel a meeting, call list_bookings first and use the uid it returns. Never guess a uid.
+  If the new time for a move is taken, offer the closest open times with show_options straight away.
 - If a request matches no meeting, say so. If it matches more than one, ask which with show_options,
   one option per meeting, value naming the meeting and its time.
-- To book: you need an event type, the attendee's name and email, and a time. If there is only one event type, use it.
-  Call find_slots, then show_options with 3-4 of the times it returned. Never offer a time find_slots didn't return.
+- Never offer or book a time find_slots didn't return.
 - book, reschedule and cancel show the founder a card with a confirm button. Don't ask "shall I go ahead?" in text,
   and don't claim anything is booked, moved or cancelled until you are told it was confirmed.
-- Be brief. When a card or options are shown, one short line like "Book this?" or "Which time?". Never mention
-  cards, tools or options by name. List meetings as '3:00 PM Title', one per line, no bullets. Use 12-hour times.
+- Be brief: one short line. Never mention cards, tools or options by name. List meetings as '3:00 PM Title',
+  one per line, no bullets. Use 12-hour times.
 """
 
 TOOLS = [
@@ -61,6 +76,15 @@ TOOLS = [
              "type": "object", "required": ["label", "value"], "properties": {
                  "label": {"type": "string", "description": "short, e.g. '2:00' or '3:00 Investor call'"},
                  "value": {"type": "string", "description": "full message, e.g. 'Thursday 2:00 PM'"}}}}}}},
+    {"name": "find_contacts", "description": "People the founder has booked with, most frequent first, with emails. "
+                                             "Pass a name or part of one.",
+     "parameters": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}},
+    {"name": "open_booking_form", "description": "Show a quick-fill booking card: meeting type, recent contacts, "
+                                                 "day and open times as taps. Pass what you already know.",
+     "parameters": {"type": "object", "properties": {
+         "name": {"type": "string"}, "email": {"type": "string"},
+         "day": {"type": "string", "description": "YYYY-MM-DD"},
+         "event_type_id": {"type": "integer"}}}},
     {"name": "book", "description": "Propose a new booking. Shows a confirm card.",
      "parameters": {"type": "object", "required": ["event_type_id", "start", "attendee_name", "attendee_email"],
                     "properties": {
@@ -119,6 +143,7 @@ class Turn:
         self.cards: list[dict] = []
         self.options: list[dict] = []
         self.view: dict | None = None
+        self.form: dict | None = None
 
 
 class Agent:
@@ -147,6 +172,16 @@ class Agent:
         if name == "show_options":
             turn.options = [{"label": o["label"], "value": o["value"]} for o in args["options"]][:6]
             return {"shown": len(turn.options)}
+        if name == "find_contacts":
+            q = args["name"].strip().lower()
+            matches = [c for c in self.contacts(tz, limit=50) if q in c["name"].lower() or q in c["email"]]
+            return {"contacts": matches[:5]}
+        if name == "open_booking_form":
+            day = args.get("day") or timeutil.now_local(tz).date().isoformat()
+            form = self.booking_form(tz, day, args.get("event_type_id"))
+            turn.form = {"prefill": {"name": args.get("name"), "email": args.get("email"), "day": day,
+                                     "event_type_id": form["event_type_id"]}, **form}
+            return {"form_shown": True}
         if name == "book":
             et = next((e for e in self.cal.event_types() if e["id"] == args["event_type_id"]), None)
             if et is None:
@@ -155,7 +190,8 @@ class Agent:
             change = store.add_change(s, "book", {
                 "event_type_id": et["id"], "start": start,
                 "name": args["attendee_name"], "email": args["attendee_email"]}, {
-                "title": et["title"], "attendee": args["attendee_name"], "minutes": et["lengthInMinutes"],
+                "title": et["title"], "attendee": args["attendee_name"], "email": args["attendee_email"],
+                "minutes": et["lengthInMinutes"],
                 # Shown from the converted time, so a wall time skipped by DST shows what will really be booked.
                 "old_start": None, "new_start": _local(start, tz)})
         elif name in ("reschedule", "cancel"):
@@ -175,6 +211,55 @@ class Agent:
             return {"error": f"unknown tool {name}"}
         turn.cards.append(change.card)
         return {"card_shown": change.card}
+
+    # ---- quick-fill booking ----
+
+    def booking_form(self, tz: str, day: str, event_type_id: int | None = None) -> dict:
+        """Everything the quick-fill card offers as taps: meeting types, recent contacts, the day's open times."""
+        types = [{"id": e["id"], "title": e["title"], "minutes": e["lengthInMinutes"]} for e in self.cal.event_types()]
+        if event_type_id not in {t["id"] for t in types}:
+            event_type_id = types[0]["id"] if types else None
+        slots = []
+        if event_type_id is not None:
+            lo, hi = timeutil.day_range_utc(day, day, tz)
+            days = self.cal.slots(event_type_id, lo, hi, tz)
+            slots = [_local(slot["start"], tz) for d in days.values() for slot in d]
+        return {"event_types": types, "event_type_id": event_type_id, "contacts": self.contacts(tz),
+                "day": day, "slots": slots}
+
+    def contacts(self, tz: str, limit: int = 8) -> list[dict]:
+        """People the founder books with, most often first, then most recent. cal.com's booking history is
+        the memory here, so there's nothing extra to store."""
+        today = timeutil.now_local(tz).date()
+        past_lo, _ = timeutil.day_range_utc((today - timedelta(days=180)).isoformat(), today.isoformat(), tz)
+        _, next_hi = timeutil.day_range_utc(today.isoformat(), (today + timedelta(days=30)).isoformat(), tz)
+        now = timeutil.to_utc(timeutil.now_local(tz).strftime("%Y-%m-%dT%H:%M"), tz)
+        # Past bookings newest first: cal.com returns at most 100, and the recent ones matter most.
+        bookings = self.cal.bookings(now, next_hi) + self.cal.bookings(past_lo, now, status="past", sort="desc")
+        people: dict[str, dict] = {}
+        for b in bookings:
+            when = b["start"]
+            for a in b.get("attendees", []):
+                email = (a.get("email") or "").lower()
+                if not email:
+                    continue
+                p = people.setdefault(email, {"name": a.get("name") or email, "email": email, "count": 0, "last": ""})
+                p["count"] += 1
+                p["last"] = max(p["last"], when)
+        ranked = sorted(people.values(), key=lambda p: (p["count"], p["last"]), reverse=True)
+        return [{"name": p["name"], "email": p["email"]} for p in ranked[:limit]]
+
+    def propose(self, s: store.Session, event_type_id: int, start: str, name: str, email: str) -> dict:
+        """Builds a Book card from the quick-fill card, with no model call."""
+        trim_history(s)
+        turn = Turn()
+        result = self._safe_tool(s, turn, "book", json.dumps(
+            {"event_type_id": event_type_id, "start": start, "attendee_name": name, "attendee_email": email}))
+        if "error" in result:
+            return {"ok": False, "message": result["error"], "cards": []}
+        s.messages.append({"role": "user", "content": f"[system] The founder filled the booking card: {name} "
+                                                      f"<{email}> at {start}. A Book card is showing."})
+        return {"ok": True, "cards": turn.cards}
 
     # ---- loop ----
 
@@ -230,7 +315,7 @@ class Agent:
 
     @staticmethod
     def _out(reply: str, turn: Turn) -> dict:
-        return {"reply": reply, "cards": turn.cards, "options": turn.options, "view": turn.view}
+        return {"reply": reply, "cards": turn.cards, "options": turn.options, "view": turn.view, "form": turn.form}
 
     # ---- confirm ----
 

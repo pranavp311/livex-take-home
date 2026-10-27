@@ -8,7 +8,7 @@ import base64
 import json
 import os
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -196,11 +196,11 @@ def chat(body: ChatIn, request: Request):
         if change.kind == "cancel":
             # A typed yes would skip the browser's undo window, so point at the card instead.
             return {"reply": "Tap Cancel it on the card to confirm.", "cards": [], "options": [], "view": None,
-                    "history": s.messages}
+                    "form": None, "history": s.messages}
         s.pending[change.id] = change
         result = agent.confirm(s, change.id)
-        return {"reply": result["message"], "cards": [], "options": [], "view": None, "confirmed": result,
-                "history": s.messages}
+        return {"reply": result["message"], "cards": [], "options": [], "view": None, "form": None,
+                "confirmed": result, "history": s.messages}
     return {**agent.chat(s, body.message), "history": s.messages}
 
 
@@ -212,12 +212,49 @@ def confirm(body: ConfirmIn, request: Request):
     return {**agent.confirm(s, change.id), "history": s.messages}
 
 
+def _check_start(start: str) -> str:
+    datetime.fromisoformat(start)  # the pattern checks the shape; this rejects 2026-13-45T99:99
+    return start
+
+
+class ProposeIn(BaseModel):
+    event_type_id: int
+    start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
+    name: str = Field(min_length=1, max_length=200)
+    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
+    tz: str
+    history: list[dict] = []
+    _tz = field_validator("tz")(_check_tz)
+    _history = field_validator("history")(_check_history)
+    _start = field_validator("start")(_check_start)
+
+
+@app.get("/api/booking-form")
+def booking_form(request: Request, tz: str, day: str | None = None, event_type_id: int | None = None):
+    try:
+        _check_tz(tz)
+        day = (date.fromisoformat(day) if day else timeutil.now_local(tz).date()).isoformat()
+        timeutil.day_range_utc(day, day, tz)  # 9999-12-31 overflows when the day's end is computed
+    except (ValueError, OverflowError) as e:
+        raise HTTPException(422, str(e))
+    return Agent(_cal(request)).booking_form(tz, day, event_type_id)
+
+
+@app.post("/api/propose")
+def propose(body: ProposeIn, request: Request):
+    agent = Agent(_cal(request))
+    s = store.Session(tz=body.tz, messages=body.history)
+    return {**agent.propose(s, body.event_type_id, body.start, body.name, body.email), "history": s.messages}
+
+
 @app.get("/api/schedule")
 def schedule(request: Request, tz: str, day: str | None = None, days: int = 1):
     try:
         _check_tz(tz)
         start_day = date.fromisoformat(day) if day else None
-    except ValueError as e:
+        if start_day:
+            timeutil.day_range_utc(start_day.isoformat(), (start_day + timedelta(days=13)).isoformat(), tz)
+    except (ValueError, OverflowError) as e:
         raise HTTPException(422, str(e))
     if not 1 <= days <= 14:
         raise HTTPException(422, "days must be 1-14")

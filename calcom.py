@@ -59,9 +59,10 @@ class CalCom:
             self._username = self.me()["username"]
         return self._call("GET", "/event-types", V_EVENT_TYPES, params={"username": self._username})
 
-    def bookings(self, after_start: str, before_end: str, status: str = "upcoming") -> list[dict]:
+    def bookings(self, after_start: str, before_end: str, status: str = "upcoming",
+                 sort: str = "asc") -> list[dict]:
         params = {"afterStart": after_start, "beforeEnd": before_end, "status": status,
-                  "sortStart": "asc", "take": 100}
+                  "sortStart": sort, "take": 100}
         return self._call("GET", "/bookings", V_BOOKINGS, params=params)
 
     def booking(self, uid: str) -> dict:

@@ -171,3 +171,20 @@ Sign-in (`auth.py`): `/api/auth/login` redirects to cal.com with a `state` cooki
 Model: DeepSeek thinking is turned off. With it on, DeepSeek rejects any tool turn whose reasoning isn't passed back, and it's slower. Verified with a live two-turn tool call.
 
 Vercel env (production): `LIVEX_OPENROUTER_API_KEY`, `CAL_OAUTH_CLIENT_ID`, `CAL_OAUTH_CLIENT_SECRET`, `PUBLIC_URL`.
+
+## Round 4: quick-fill booking and voice
+
+Typing every detail is too much work, so booking gets one card with tappable choices, and the message box gets a mic.
+
+```
+GET  /api/booking-form ?tz=&day=YYYY-MM-DD&event_type_id=
+     -> {event_types: [{id, title, minutes}], contacts: [{name, email}], day, slots: ["YYYY-MM-DDTHH:MM"]}
+POST /api/propose {tz, history, event_type_id, start, name, email}
+     -> {cards: [Card], history}
+chat response gains  form: {prefill: {name, email, day, event_type_id}, ...same as /api/booking-form} | null
+```
+
+- `contacts` are the people on your bookings from the last 180 days and next 30, ranked by how often you book them, then by most recent, at most 8. cal.com's booking history is the memory, so nothing is stored. `find_contacts` lets the model turn a first name into an email from the same list.
+- The model calls `open_booking_form` with whatever it already knows instead of asking for missing details in text.
+- `/api/propose` builds the Book card without a model call, through the same code as the `book` tool, and notes it in the history so the model knows.
+- Voice uses the browser's own speech recognition (Web Speech API): free, nothing sent to our server. The mic is hidden where it isn't supported (Firefox).

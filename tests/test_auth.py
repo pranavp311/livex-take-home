@@ -211,3 +211,19 @@ def test_history_is_limited_to_real_chat_of_sane_size(client, history):
     # The browser holds the chat; it mustn't be able to swap the system prompt or bulk-spend the model key.
     client.cookies.set("cal_tokens", cookie(GOOD))
     assert client.post("/api/chat", json={"message": "hi", "tz": "UTC", "history": history}).status_code == 422
+
+
+@pytest.mark.parametrize("field,value", [("email", "not-an-email"), ("start", "Thursday 2pm"), ("name", "")])
+def test_propose_rejects_incomplete_cards(client, field, value):
+    client.cookies.set("cal_tokens", cookie(GOOD))
+    body = {"event_type_id": 7, "start": "2026-10-29T14:00", "name": "P", "email": "p@example.com", "tz": "UTC",
+            field: value}
+    assert client.post("/api/propose", json=body).status_code == 422
+
+
+def test_impossible_dates_are_client_errors_not_crashes(client):
+    client.cookies.set("cal_tokens", cookie(GOOD))
+    assert client.get("/api/booking-form", params={"tz": "UTC", "day": "9999-12-31"}).status_code == 422
+    assert client.get("/api/schedule", params={"tz": "UTC", "day": "9999-12-31"}).status_code == 422
+    body = {"event_type_id": 7, "start": "2026-13-45T99:99", "name": "P", "email": "p@example.com", "tz": "UTC"}
+    assert client.post("/api/propose", json=body).status_code == 422

@@ -13,7 +13,7 @@ from calcom import CalCom
 LA = "America/Los_Angeles"
 BOOKING = {
     "uid": "bk_1", "title": "Investor call", "start": "2026-10-28T22:00:00Z", "end": "2026-10-28T22:30:00Z",
-    "attendees": [{"name": "Dana"}], "eventType": {"id": 7},
+    "attendees": [{"name": "Dana", "email": "Dana@Example.com"}], "eventType": {"id": 7},
 }
 
 
@@ -43,6 +43,9 @@ class FakeCal:
             return httpx.Response(200, json={"data": BOOKING})
         if path == "/v2/bookings":
             return httpx.Response(200, json={"data": [BOOKING]})
+        if path == "/v2/slots":
+            return httpx.Response(200, json={"data": {"2026-10-29": [
+                {"start": "2026-10-29T21:00:00.000Z", "end": "2026-10-29T21:30:00.000Z"}]}})
         return httpx.Response(404, json={"error": {"message": "nope"}})
 
     def writes(self):
@@ -205,3 +208,64 @@ def test_long_chat_keeps_working_instead_of_locking_the_user_out():
     agent.chat(s, "hi")
     assert len(json.dumps(s.messages)) <= agent_mod.MAX_HISTORY_CHARS + 5000
     assert s.messages[0]["role"] == "user"
+
+
+def test_missing_details_open_the_quick_fill_card_with_what_is_known():
+    # Typing name, email and time is too much work; the card offers them as taps, pre-filled from the chat.
+    agent, fake, s = make([("open_booking_form", {"name": "Priya", "day": "2026-10-29"}), "Who and when?"])
+    out = agent.chat(s, "book an intro with Priya thursday")
+    form = out["form"]
+    assert form["prefill"] == {"name": "Priya", "email": None, "day": "2026-10-29", "event_type_id": 7}
+    assert form["event_types"] == [{"id": 7, "title": "30 min intro", "minutes": 30}]
+    assert form["slots"] == ["2026-10-29T14:00"]  # local time, not UTC
+    # One entry per person even though they appear on both the upcoming and past lists.
+    assert form["contacts"] == [{"name": "Dana", "email": "dana@example.com"}]
+    assert fake.writes() == []
+
+
+def test_filled_card_becomes_a_book_card_without_writing():
+    agent, fake, s = make([])
+    out = agent.propose(s, 7, "2026-10-29T14:00", "Priya", "priya@example.com")
+    [card] = out["cards"]
+    assert out["ok"] and card["kind"] == "book" and card["args"]["start"] == "2026-10-29T21:00:00Z"
+    assert fake.writes() == []
+    assert "filled the booking card" in s.messages[-1]["content"]  # the model knows what happened
+
+
+def test_filled_card_with_unknown_meeting_type_says_so():
+    agent, fake, s = make([])
+    out = agent.propose(s, 999, "2026-10-29T14:00", "Priya", "priya@example.com")
+    assert not out["ok"] and out["cards"] == [] and s.messages == []
+
+
+def test_contacts_rank_by_how_often_you_book_them():
+    # The people a founder books with most should be one tap away, ahead of a one-off from yesterday.
+    def booking(email, start):
+        return {**BOOKING, "start": start, "attendees": [{"name": email.split("@")[0], "email": email}]}
+    agent, fake, s = make([])
+    data = [booking("often@x.com", "2026-09-01T17:00:00Z"), booking("often@x.com", "2026-09-08T17:00:00Z"),
+            booking("often@x.com", "2026-09-15T17:00:00Z"), booking("once@x.com", "2026-10-26T17:00:00Z")]
+    agent.cal.bookings = lambda lo, hi, status="upcoming", sort="asc": data if status == "past" else []
+    assert [c["email"] for c in agent.contacts(LA)] == ["often@x.com", "once@x.com"]
+
+
+def test_a_known_first_name_resolves_to_an_email():
+    agent, fake, s = make([("find_contacts", {"name": "dana"}), "ok"])
+    agent.chat(s, "book dana")
+    tool = json.loads(next(m for m in s.messages if m["role"] == "tool")["content"])
+    assert tool == {"contacts": [{"name": "Dana", "email": "dana@example.com"}]}
+
+
+def test_contacts_ask_for_past_bookings_newest_first():
+    # cal.com returns at most 100 per call; asking oldest-first would drop last week's regulars.
+    agent, fake, s = make([])
+    seen = []
+    agent.cal.bookings = lambda lo, hi, status="upcoming", sort="asc": seen.append((status, sort)) or []
+    agent.contacts(LA)
+    assert ("past", "desc") in seen
+
+
+def test_book_card_shows_the_email_so_a_wrong_one_can_be_caught():
+    agent, fake, s = make([])
+    card = agent.propose(s, 7, "2026-10-29T14:00", "Priya", "priya@example.com")["cards"][0]
+    assert card["email"] == "priya@example.com"

@@ -39,6 +39,8 @@ button:disabled { cursor: default; }
   width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--line); background: var(--soft);
   font: 500 13px Inter, system-ui, sans-serif; color: var(--ink); cursor: pointer; flex-shrink: 0; padding: 0;
 }
+.pill.new { color: var(--muted); }
+.left + .new, .pill + .new { margin-left: 10px; }
 .phead .acct { display: none; margin-left: auto; width: 36px; height: 36px; }
 .menu {
   position: fixed; top: 56px; right: 16px; z-index: 5; min-width: 180px; background: #fff; border: 1px solid var(--line);
@@ -69,7 +71,7 @@ button:disabled { cursor: default; }
 .left { margin-left: auto; font-size: 13px; color: var(--muted); }
 .left b { color: var(--ink); font-weight: 500; }
 .pill {
-  margin-left: auto; height: 32px; padding: 0 14px; border-radius: 999px;
+  margin-left: auto; flex-shrink: 0; height: 32px; padding: 0 14px; border-radius: 999px;
   border: 1px solid var(--line); background: #fff; color: var(--ink);
   font: 500 13px Inter, system-ui, sans-serif; cursor: pointer;
 }
@@ -267,6 +269,30 @@ button:disabled { cursor: default; }
   background: #fff; display: grid; place-items: center; cursor: pointer; flex-shrink: 0;
 }
 .send:disabled { opacity: .4; }
+.mic {
+  width: 40px; height: 40px; border-radius: 50%; border: 0; background: none; color: var(--blue);
+  display: grid; place-items: center; cursor: pointer; flex-shrink: 0;
+}
+.mic[aria-pressed="true"] { background: var(--blue); color: #fff; animation: lxPulse 1.4s ease-in-out infinite; }
+.mic[aria-pressed="true"] .cap { fill: currentColor; }
+@keyframes lxPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(5, 13, 200, .28); } 50% { box-shadow: 0 0 0 6px rgba(5, 13, 200, 0); } }
+
+/* Quick-fill booking card */
+.card.form { width: 440px; gap: 14px; }
+.form .sec { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+.form .lab { font-size: 13px; color: var(--muted); }
+.form .chips { gap: 6px; }
+.form .chip { height: 32px; padding: 0 12px; }
+.form .chip:disabled, .form input:disabled { opacity: .56; }
+.form .fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 6px; }
+.form input {
+  width: 100%; min-width: 0; height: 36px; border: 1px solid var(--line); border-radius: 999px; padding: 0 14px;
+  font: 400 15px Inter, system-ui, sans-serif; color: var(--ink); background: #fff;
+}
+.form input:focus { outline: 0; border-color: var(--blue); }
+.form input[type="time"] { width: auto; align-self: flex-start; font-variant-numeric: tabular-nums; }
+.form .hint { font-size: 13px; color: var(--muted); align-self: center; }
+.cta:disabled { opacity: .4; }
 
 .toast {
   position: absolute; left: var(--pad); right: var(--pad); bottom: 92px; height: 48px; border-radius: 999px;
@@ -315,6 +341,7 @@ button:disabled { cursor: default; }
   .pbody.dayin { animation: lxFade 150ms ease-out both; }
   .toast { animation: lxFade 200ms ease-out both; }
   .dot { animation: none; opacity: .7; }
+  .mic[aria-pressed="true"] { animation: none; }
 }
 
 /* ---------- Phone ---------- */
@@ -328,6 +355,14 @@ button:disabled { cursor: default; }
   .circle { width: 28px; height: 28px; }
   .phead .acct { display: block; }
   .phead .pill + .acct { margin-left: 10px; }
+  .left + .new { margin-left: auto; }
+  .card.form { width: 100%; }
+  .form .chip, .form input, .mic { height: 44px; min-height: 44px; }
+  .mic { width: 44px; }
+  .form .chip { padding: 0 14px; }
+  .form input { font-size: 16px; }
+  .form .fields { grid-template-columns: minmax(0, 1fr); }
+  .form .acts .cta, .form .acts .ghost { height: 44px; }
   .menu { top: 60px; }
   .phead .left, .strip, .listhead, .listsec > .more, .free { display: none; }
   .next { padding: 12px 14px; }
